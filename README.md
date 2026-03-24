@@ -12,4 +12,13 @@
 
 The email brief is hardcoded in `run.py` (`BRIEF`).
 
-On AWS (e.g. EC2), install Python 3 if needed, clone the repo, add `.env`, then run `./setup_and_run.sh` from this folder.
+### Ubuntu / Debian (including EC2)
+
+Install the venv module once (needed for `python3 -m venv`):
+
+```bash
+sudo apt update
+sudo apt install -y python3-venv python3-pip
+```
+
+If the error says to install `python3.12-venv`, use that package name instead (match your `python3 --version`). If a previous run left a broken `.venv`, remove it: `rm -rf .venv`, then `./setup_and_run.sh` again.
