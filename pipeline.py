@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import re
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -19,8 +22,27 @@ from agents import (
     input_guardrail,
     trace,
 )
+from agents.lifecycle import RunHooks
+from agents.run_context import RunContextWrapper
+from agents.tool import Tool
+
+from telegram_util import bind_steps_list, log_step, steps_reset
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+
+EMAIL_PATTERN = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+
+
+def _is_valid_email(addr: str) -> bool:
+    s = (addr or "").strip()
+    return bool(s and EMAIL_PATTERN.fullmatch(s))
+
+
+class ParsedInput(BaseModel):
+    recipient_email: str = Field(
+        description="Recipient email (plain user@domain) or empty if missing.",
+    )
+    brief: str = Field(description="Campaign instructions for the SDR, excluding the recipient address.")
 
 
 class DraftReview(BaseModel):
@@ -33,28 +55,132 @@ class NameCheckOutput(BaseModel):
     name: str
 
 
-INSTRUCTIONS1 = """You are a sales agent working for ComplAI, \
-a company that provides a SaaS tool for ensuring SOC2 compliance and preparing for audits, powered by AI. \
-You write professional, serious cold emails without subject lines only the email body."""
+# Shared by all drafters: reduces default "Silicon Valley outbound" bias and stereotypical hooks.
+DRAFTER_SHARED = """
 
-INSTRUCTIONS2 = """You are a humorous, engaging sales agent working for ComplAI, \
-a company that provides a SaaS tool for ensuring SOC2 compliance and preparing for audits, powered by AI. \
-You write witty, engaging cold emails without subject lines only the email body that are likely to get a response."""
+Ground rules (all drafts):
+- Follow the user's brief for audience, persona, region, industry, and formality. Do not override it with your own assumptions.
+- Do not guess the recipient's gender, background, or personal traits; use neutral salutations ("Hello," "Hi there," or role/title from the brief) unless the brief names the person.
+- Avoid stereotypes, caricatures, or humor at the expense of any group. Wit should be good-natured and restrained—never snark about roles, companies, or regions.
+- Do not invent metrics, logos, customers, audits, or certifications. Stay within plausible claims for ComplAI as SOC2 / audit-readiness assistance software.
+- Keep tone inclusive and respectful; avoid idioms that rely on narrow cultural context unless the brief targets that locale.
+"""
 
-INSTRUCTIONS3 = """You are a busy sales agent working for ComplAI, \
-a company that provides a SaaS tool for ensuring SOC2 compliance and preparing for audits, powered by AI. \
-You write concise, to the point cold emails without subject lines only the email body."""
+INSTRUCTIONS1 = (
+    """You represent ComplAI: a SaaS product that helps teams work toward SOC2 and audit readiness, with AI-assisted workflows. \
+You write the email body only (no subject line), in a calm, direct, businesslike voice—clear and serious without being cold."""
+    + DRAFTER_SHARED
+)
 
-ANALYSER_INSTRUCTIONS = """You are a quality reviewer for outbound cold emails at ComplAI (SOC2 / audit-compliance SaaS).
+INSTRUCTIONS2 = (
+    """You represent ComplAI: a SaaS product that helps teams work toward SOC2 and audit readiness, with AI-assisted workflows. \
+You write the email body only (no subject line), in a warm, lightly personable voice. You may use gentle humor or a clever line \
+if it fits the brief, but never at the recipient's expense and never relying on stereotypes."""
+    + DRAFTER_SHARED
+)
+
+INSTRUCTIONS3 = (
+    """You represent ComplAI: a SaaS product that helps teams work toward SOC2 and audit readiness, with AI-assisted workflows. \
+You write the email body only (no subject line), as short as possible while respectful and complete—no filler, no clichéd urgency."""
+    + DRAFTER_SHARED
+)
+
+REVIEWER_INSTRUCTIONS = """You are a quality reviewer for outbound cold emails at ComplAI (SOC2 / audit-readiness SaaS).
 
 You receive the user's request, the three draft bodies, which draft was chosen, and optional rationale.
-Decide if the chosen draft is clear, professional, and on-brief. Output only structured accept + feedback."""
+
+Judge the chosen draft on:
+- Fit to the user's brief (audience, goal, tone, facts).
+- Clarity and honesty (no fabricated proof points or stats).
+- Respect and inclusion: no demeaning, exoticizing, or stereotypical language; no assumptions about the recipient beyond the brief.
+- Tone appropriate to the brief—not "professional" only in the narrow sense of formal US enterprise mail; match what the brief asked for.
+
+Reject (accept: false) if the draft is off-brief, misleading, or unfair to the reader. Output only structured accept + feedback."""
 
 SALES_MANAGER_INSTRUCTIONS = """
 You are a Sales Manager at ComplAI. Use sales_agent1, sales_agent2, sales_agent3 to get three drafts (body only, no subject).
-Pick the best, call review_draft_email with the user's request, all three drafts, chosen number (1–3), winning body, and rationale.
+Pick the best option for the user's stated goal and audience—not a default preference for one tone. Call review_draft_email with the user's request, all three drafts, chosen number (1–3), winning body, and rationale.
 If accept is true, hand off the winning body to Email Manager via transfer_to_email_manager. If accept is false, revise and review again (at most two rounds), then hand off if needed per your judgment.
 """
+
+INPUT_PARSER_INSTRUCTIONS = """You parse the user's message into two fields only (structured output, no extra text).
+
+recipient_email: One valid outbound address (local-part@domain). Strip mailto:, URLs, and brackets. If no plausible email exists, use an empty string. Never invent an address.
+
+brief: Everything else—the campaign instructions (product, audience, tone, persona)—without repeating only the email line."""
+
+_TOOL_DRAFT_LABELS = {"sales_agent1": "1", "sales_agent2": "2", "sales_agent3": "3"}
+
+
+async def _delay_if_configured() -> None:
+    sec = float(os.environ.get("TELEGRAM_STEP_DELAY_SEC", "0") or "0")
+    if sec > 0:
+        await asyncio.sleep(sec)
+
+
+async def _log(step: str) -> None:
+    log_step(step)
+    await _delay_if_configured()
+
+
+class DemoRunHooks(RunHooks):
+    """Live step lines for Telegram/console via ``log_step`` (tool start/end)."""
+
+    def __init__(self) -> None:
+        self._pending_revise = False
+
+    async def on_tool_start(
+        self,
+        context: RunContextWrapper[Any],
+        agent: Agent[Any],
+        tool: Tool,
+    ) -> None:
+        name = tool.name
+        if name in _TOOL_DRAFT_LABELS:
+            if self._pending_revise:
+                await _log("🔁 Revising draft...")
+                self._pending_revise = False
+            n = _TOOL_DRAFT_LABELS[name]
+            await _log(f"✍️ Sales Agent {n} generating draft...")
+            return
+        if name == "review_draft_email":
+            await _log("🧪 Reviewer evaluating draft...")
+            return
+        if name == "send_html_email":
+            await _log("📤 Sending email...")
+
+    async def on_tool_end(
+        self,
+        context: RunContextWrapper[Any],
+        agent: Agent[Any],
+        tool: Tool,
+        result: str,
+    ) -> None:
+        name = tool.name
+        if name == "review_draft_email":
+            try:
+                data = json.loads(result)
+                if data.get("accept") is True:
+                    await _log("✅ Reviewer accepted draft")
+                elif data.get("accept") is False:
+                    await _log("❌ Reviewer rejected draft")
+                    self._pending_revise = True
+                else:
+                    await _log("🧪 Reviewer evaluated draft (no clear accept/reject)")
+            except (json.JSONDecodeError, TypeError):
+                await _log("🧪 Reviewer evaluated draft (parse error)")
+            return
+        if name == "send_html_email":
+            await _log("✅ Email sent successfully")
+
+
+def _input_parser_agent() -> Agent[Any]:
+    return Agent(
+        name="Input parser",
+        instructions=INPUT_PARSER_INSTRUCTIONS,
+        model="gpt-4o-mini",
+        output_type=ParsedInput,
+    )
 
 
 def _review_tool_output(output: RunResult) -> Any:
@@ -69,7 +195,7 @@ async def _review_tool_output_async(output: RunResult) -> str:
     return str(_review_tool_output(output))
 
 
-def build_agents() -> tuple[Agent, Agent]:
+def build_agents(recipient_email: str | None = None) -> tuple[Agent, Agent]:
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is required")
     if not os.environ.get("DEEPSEEK_API_KEY"):
@@ -81,26 +207,48 @@ def build_agents() -> tuple[Agent, Agent]:
     )
     deepseek_model = OpenAIChatCompletionsModel(model="deepseek-chat", openai_client=deepseek_client)
 
-    sales_agent1 = Agent(name="DeepSeek Sales Agent", instructions=INSTRUCTIONS1, model=deepseek_model)
-    sales_agent2 = Agent(name="Gemini Sales Agent", instructions=INSTRUCTIONS2, model=deepseek_model)
-    sales_agent3 = Agent(name="Llama3.3 Sales Agent", instructions=INSTRUCTIONS3, model=deepseek_model)
+    sales_agent1 = Agent(
+        name="ComplAI drafter — professional tone",
+        instructions=INSTRUCTIONS1,
+        model=deepseek_model,
+    )
+    sales_agent2 = Agent(
+        name="ComplAI drafter — engaging tone",
+        instructions=INSTRUCTIONS2,
+        model=deepseek_model,
+    )
+    sales_agent3 = Agent(
+        name="ComplAI drafter — concise tone",
+        instructions=INSTRUCTIONS3,
+        model=deepseek_model,
+    )
 
-    td = "Write a cold sales email"
-    tool1 = sales_agent1.as_tool(tool_name="sales_agent1", tool_description=td)
-    tool2 = sales_agent2.as_tool(tool_name="sales_agent2", tool_description=td)
-    tool3 = sales_agent3.as_tool(tool_name="sales_agent3", tool_description=td)
+    tool1 = sales_agent1.as_tool(
+        tool_name="sales_agent1",
+        tool_description="Draft cold email body (no subject), professional and serious tone.",
+    )
+    tool2 = sales_agent2.as_tool(
+        tool_name="sales_agent2",
+        tool_description="Draft cold email body (no subject), witty and engaging tone.",
+    )
+    tool3 = sales_agent3.as_tool(
+        tool_name="sales_agent3",
+        tool_description="Draft cold email body (no subject), concise and direct tone.",
+    )
 
-    analyser = Agent(
-        name="Email draft analyser",
-        instructions=ANALYSER_INSTRUCTIONS,
+    draft_reviewer = Agent(
+        name="Email draft reviewer",
+        instructions=REVIEWER_INSTRUCTIONS,
         model="gpt-4o-mini",
         output_type=DraftReview,
     )
-    review_tool = analyser.as_tool(
+    review_tool = draft_reviewer.as_tool(
         tool_name="review_draft_email",
         tool_description="Review draft choice; returns JSON with accept and feedback.",
         custom_output_extractor=_review_tool_output_async,
     )
+
+    to_override = (recipient_email or "").strip()
 
     @function_tool
     def send_html_email(subject: str, html_body: str) -> dict[str, str]:
@@ -108,12 +256,12 @@ def build_agents() -> tuple[Agent, Agent]:
         from sendgrid.helpers.mail import Content, Email, Mail, To
 
         key = os.environ.get("SENDGRID_API_KEY")
-        from_addr = os.environ.get("SENDGRID_FROM_EMAIL", "geekyoswald@gmail.com")
-        to_addr = os.environ.get("SENDGRID_TO_EMAIL", "geekyoswald@gmail.com")
+        from_addr = os.environ.get("SENDGRID_FROM_EMAIL")
+        to_addr = to_override or os.environ.get("SENDGRID_TO_EMAIL")
         if not key:
             raise RuntimeError("SENDGRID_API_KEY is not set")
         if not from_addr or not to_addr:
-            raise RuntimeError("SENDGRID_FROM_EMAIL and SENDGRID_TO_EMAIL must be set")
+            raise RuntimeError("SENDGRID_FROM_EMAIL and a recipient (parsed email or SENDGRID_TO_EMAIL) must be set")
 
         sg = sendgrid.SendGridAPIClient(api_key=key)
         mail = Mail(Email(from_addr), To(to_addr), subject, Content("text/html", html_body)).get()
@@ -121,17 +269,30 @@ def build_agents() -> tuple[Agent, Agent]:
         return {"status": "success"}
 
     subj = Agent(
-        name="Email subject writer",
-        instructions="Write a compelling subject line for the given cold email body.",
+        name="Subject line writer",
+        instructions=(
+            "Write one short subject line that accurately reflects the email body. "
+            "No clickbait, false urgency, or bait-and-switch. "
+            "Use neutral, inclusive wording; avoid gendered or stereotypical hooks."
+        ),
         model="gpt-4o-mini",
     )
     html = Agent(
-        name="HTML email body converter",
-        instructions="Convert the email body to simple, clear HTML.",
+        name="HTML body formatter",
+        instructions=(
+            "Convert the email body to simple, readable HTML (paragraphs, minimal styling). "
+            "Preserve meaning and inclusive wording; do not add claims or flair not in the source text."
+        ),
         model="gpt-4o-mini",
     )
-    subject_tool = subj.as_tool(tool_name="subject_writer", tool_description="Write email subject")
-    html_tool = html.as_tool(tool_name="html_converter", tool_description="Convert body to HTML")
+    subject_tool = subj.as_tool(
+        tool_name="subject_writer",
+        tool_description="Write a short, compelling subject line for the email body.",
+    )
+    html_tool = html.as_tool(
+        tool_name="html_converter",
+        tool_description="Convert plain email body to simple, readable HTML.",
+    )
 
     emailer = Agent(
         name="Email Manager",
@@ -153,8 +314,13 @@ def build_agents() -> tuple[Agent, Agent]:
     )
 
     guard = Agent(
-        name="Name check",
-        instructions="Check if the user message includes a person's name as the sender identity.",
+        name="Sender identity check",
+        instructions=(
+            "Read the user message. Set is_name_in_message to true only if it specifies a particular person's name "
+            "as the sender (e.g. sign-off, 'from FirstName LastName', or similar). "
+            "Do not treat product names, company names, or role-only labels (e.g. 'Head of Sales') as a person's name. "
+            "If true, set name to that person's name or empty string if unclear. Be consistent for names from any cultural background."
+        ),
         output_type=NameCheckOutput,
         model="gpt-4o-mini",
     )
@@ -168,7 +334,7 @@ def build_agents() -> tuple[Agent, Agent]:
         )
 
     careful = Agent(
-        name="Sales Manager",
+        name="Sales Manager (input screened)",
         instructions=SALES_MANAGER_INSTRUCTIONS,
         tools=sm_tools,
         handoffs=[emailer],
@@ -188,13 +354,55 @@ def _out(obj: Any) -> Any:
 
 
 async def run_sdr_pipeline(message: str, *, use_name_guardrail: bool = False) -> dict[str, Any]:
-    sm, careful = build_agents()
-    agent = careful if use_name_guardrail else sm
-    name = os.environ.get("WORKFLOW_TRACE_NAME", "Automated SDR")
-    with trace(name):
-        result = await Runner.run(agent, message)
-    return {
-        "final_output": _out(result.final_output),
-        "last_agent": result.last_agent.name,
-    }
+    steps: list[str] = []
+    ctx_tok = bind_steps_list(steps)
+    trace_name = os.environ.get("WORKFLOW_TRACE_NAME", "Automated SDR")
+    try:
+        with trace(trace_name):
+            await _log("🧠 Parsing input...")
+
+            parser = _input_parser_agent()
+            parse_result = await Runner.run(parser, message)
+            raw_parsed = parse_result.final_output
+
+            if raw_parsed is None:
+                await _log("❌ Could not find a valid email in your message")
+                return {
+                    "recipient_email": "",
+                    "steps": steps,
+                    "final_output": None,
+                    "last_agent": getattr(parse_result.last_agent, "name", "Input parser"),
+                }
+
+            p = raw_parsed if isinstance(raw_parsed, ParsedInput) else ParsedInput.model_validate(raw_parsed)
+
+            if not _is_valid_email(p.recipient_email):
+                await _log("❌ Could not find a valid email in your message")
+                return {
+                    "recipient_email": (p.recipient_email or "").strip(),
+                    "steps": steps,
+                    "final_output": None,
+                    "last_agent": parse_result.last_agent.name,
+                }
+
+            recipient = p.recipient_email.strip()
+            await _log(f"✅ Extracted recipient: {recipient}")
+
+            brief = (p.brief or "").strip() or "Send a professional ComplAI cold email per the user request."
+
+            sm, careful = build_agents(recipient_email=recipient)
+            agent = careful if use_name_guardrail else sm
+            hooks = DemoRunHooks()
+            result = await Runner.run(agent, brief, hooks=hooks)
+
+        await _log("🎉 Workflow completed successfully!")
+
+        return {
+            "recipient_email": recipient,
+            "steps": steps,
+            "final_output": _out(result.final_output),
+            "last_agent": result.last_agent.name,
+        }
+    finally:
+        steps_reset(ctx_tok)
 

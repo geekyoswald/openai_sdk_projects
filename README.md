@@ -2,7 +2,9 @@
 
 This project is a **demonstration SDR (Sales Development Rep) workflow** built with the **[OpenAI Agents SDK](https://github.com/openai/openai-agents-python)** (`openai-agents`). A single user **brief** (natural language) is turned into **three alternative email bodies**, **quality-checked with structured output**, optionally **revised**, then **handed off** to an agent that **writes a subject**, **converts to HTML**, and **sends via SendGrid**.
 
-The orchestration — multiple specialist agents exposed as **tools**, **structured review**, **handoffs**, optional **input guardrails**, and **workflow tracing** — lives in `pipeline.py`. The entrypoint `run.py` loads environment variables, passes one hardcoded brief, and prints JSON.
+The orchestration — multiple specialist agents exposed as **tools**, **structured review**, **handoffs**, optional **input guardrails**, **workflow tracing**, **Telegram step updates**, and a **FastAPI webhook** — lives mainly in `pipeline.py`, `telegram_util.py`, and `webhook_app.py`. The entrypoint `run.py` loads environment variables, sets `USER_MESSAGE`, and prints JSON.
+
+**→ Local install, `.env`, and running on your laptop:** **[SETUP_LOCAL.md](SETUP_LOCAL.md)**
 
 ---
 
@@ -14,10 +16,9 @@ The orchestration — multiple specialist agents exposed as **tools**, **structu
 4. [Step-by-step execution](#step-by-step-execution)
 5. [Decision graphs](#decision-graphs)
 6. [Models and APIs](#models-and-apis)
-7. [Environment variables](#environment-variables)
-8. [How to run](#how-to-run)
-9. [Tracing](#tracing)
-10. [Invoking the guardrail variant from code](#invoking-the-guardrail-variant-from-code)
+7. [Tracing](#tracing)
+8. [Invoking the guardrail variant from code](#invoking-the-guardrail-variant-from-code)
+9. [Summary](#summary)
 
 ---
 
@@ -25,15 +26,16 @@ The orchestration — multiple specialist agents exposed as **tools**, **structu
 
 | Phase | Who | What |
 |--------|-----|------|
-| **1. Input** | You / `run.py` | A string brief (e.g. tone, persona, recipient) is the only user message to the top-level agent. |
+| **0. Parse** | **Input parser** (`ParsedInput`) | `run.py` passes one **natural-language** string. The parser extracts **`recipient_email`** + **`brief`** (strict email validation afterward). |
+| **1. SDR input** | Sales Manager (orchestrator) | Receives **`brief`** only (not the raw NL). Optional guardrail still applies to this brief. |
 | **2. Drafting** | Sales Manager (orchestrator) | Calls three **tool-wrapped** drafter agents in parallel conceptually (the model chooses call order). Each returns **body only**, no subject. |
-| **3. Selection & review** | Sales Manager + **Email draft analyser** (as tool) | Manager picks draft 1–3, calls `review_draft_email`, which returns **`DraftReview`**: `accept: bool` + `feedback: str`. |
+| **3. Selection & review** | Sales Manager + **Email draft reviewer** (as tool) | Manager picks draft 1–3, calls `review_draft_email`, which returns **`DraftReview`**: `accept: bool` + `feedback: str`. |
 | **4. Revision loop** | Sales Manager (instructed) | If `accept` is false, manager may revise and re-review **up to ~two rounds** (soft limit in instructions), then proceed per judgment. |
 | **5. Handoff** | Sales Manager → **Email Manager** | On success path, manager **hands off** so the Email Manager receives the winning body. |
 | **6. Send path** | Email Manager | Uses `subject_writer` → `html_converter` → **`send_html_email`** (SendGrid). |
-| **7. Output** | `run_sdr_pipeline` | Returns JSON: `final_output`, `last_agent` (name of agent that produced the final message). |
+| **7. Output** | `run_sdr_pipeline` | Returns JSON: **`recipient_email`**, **`steps`**, `final_output`, `last_agent`. Parsing errors add **`❌ Could not find a valid email…`** to `steps` (and Telegram if configured). |
 
-Optional **before phase 1**: if you use the **careful** entry agent, an **input guardrail** runs a small **Name check** agent on the user message; if it decides a **sender-identity name** is present, the guardrail **trips** (`tripwire_triggered`).
+Optional **before drafting**: with **`Sales Manager (input screened)`**, an **input guardrail** runs the **Sender identity check** on the **`brief`** (not the raw NL containing the email); if a **sender-identity name** is present, the guardrail **trips** (`tripwire_triggered`).
 
 ---
 
@@ -42,10 +44,15 @@ Optional **before phase 1**: if you use the **careful** entry agent, an **input 
 | File | Role |
 |------|------|
 | `pipeline.py` | Builds all agents, tools, handoffs, guardrail; exports `run_sdr_pipeline`. |
-| `run.py` | `load_dotenv`, sets `BRIEF`, calls `run_sdr_pipeline(BRIEF)`, prints JSON. |
-| `setup_and_run.sh` | Creates venv, installs deps, runs `python run.py`. |
-| `requirements.txt` | `openai`, `openai-agents`, `sendgrid`, `python-dotenv`, `pydantic`. |
-| `.env.example` | Template for API keys and SendGrid addresses. |
+| `telegram_util.py` | `send_telegram_message`, `log_step`, per-run `steps` context (`bind_steps_list` / `steps_reset`). |
+| `webhook_app.py` | FastAPI `POST /telegram-webhook` → `run_sdr_pipeline`. |
+| `run.py` | `load_dotenv`, sets `USER_MESSAGE` (natural language), calls `run_sdr_pipeline`, prints JSON. |
+| `SETUP_LOCAL.md` | **Local** setup, `.env`, scripts, optional Telegram dev server. |
+| `setup_and_run_local.sh` | Local / macOS: venv + deps + `run.py` (no `apt` / `sudo`). |
+| `setup_and_run_aws.sh` | Ubuntu / Debian / EC2: installs `python3-venv` via `apt` if needed, then same. |
+| `setup_and_run.sh` | Alias for **`setup_and_run_local.sh`** (backward compatible). |
+| `requirements.txt` | `openai`, `openai-agents`, `sendgrid`, `python-dotenv`, `pydantic`, `requests`, `fastapi`, `uvicorn`. |
+| `.env.example` | Template for API keys and SendGrid / Telegram variables. |
 
 ---
 
@@ -56,7 +63,7 @@ The **top-level runnable agent** is either:
 - **`sales_manager`** — same graph, **no** input guardrail (default in `run_sdr_pipeline(..., use_name_guardrail=False)`).
 - **`careful`** — **same tools and handoffs**, but with **`input_guardrails=[guardrail_against_name]`** (`use_name_guardrail=True`).
 
-Both are configured with `name="Sales Manager"` in code; the **last_agent** in the result helps distinguish which subgraph completed (e.g. **Email Manager** after handoff).
+Entry agents use distinct names in traces: **`Sales Manager`** (default) vs **`Sales Manager (input screened)`** when the guardrail is enabled. After a successful handoff, **last_agent** is typically **Email Manager**.
 
 ### High-level agent relations (tools & handoffs)
 
@@ -64,18 +71,18 @@ Both are configured with `name="Sales Manager"` in code; the **last_agent** in t
 flowchart TB
     subgraph Entry["Entry (pick one in code)"]
         SM["Sales Manager<br/>gpt-4o-mini<br/>no input guardrail"]
-        CARE["Sales Manager careful<br/>gpt-4o-mini<br/>same tools + handoffs"]
+        CARE["Sales Manager (input screened)<br/>gpt-4o-mini<br/>same tools + handoffs"]
     end
 
     subgraph Guard["Runs first only for careful"]
-        GR["input_guardrail<br/>→ Name check agent"]
+        GR["input_guardrail<br/>→ Sender identity check"]
     end
 
     subgraph SM_Tools["Sales Manager tool loop"]
-        T1["sales_agent1<br/>(DeepSeek drafter)"]
-        T2["sales_agent2<br/>(DeepSeek drafter)"]
-        T3["sales_agent3<br/>(DeepSeek drafter)"]
-        RV["review_draft_email<br/>(Email draft analyser → DraftReview)"]
+        T1["sales_agent1<br/>professional tone · DeepSeek"]
+        T2["sales_agent2<br/>engaging tone · DeepSeek"]
+        T3["sales_agent3<br/>concise tone · DeepSeek"]
+        RV["review_draft_email<br/>(Email draft reviewer → DraftReview)"]
     end
 
     subgraph EmailBranch["After handoff"]
@@ -99,7 +106,7 @@ sequenceDiagram
     participant User as User brief
     participant Runner as Agents Runner
     participant GR as guardrail_against_name
-    participant NC as Name check agent
+    participant NC as Sender identity check
     participant SM as Sales Manager
 
     User->>Runner: message
@@ -119,14 +126,15 @@ sequenceDiagram
 
 ## Step-by-step execution
 
-1. **`run.py`** calls `run_sdr_pipeline(BRIEF)` with the string in `BRIEF`.
-2. **`build_agents()`** validates `OPENAI_API_KEY` and `DEEPSEEK_API_KEY`, constructs DeepSeek client + `OpenAIChatCompletionsModel` for the three drafters, wires `gpt-4o-mini` agents for orchestration, review, subject, HTML, and the Email Manager.
-3. **`trace(WORKFLOW_TRACE_NAME or "Automated SDR")`** wraps the run for observability (see [Tracing](#tracing)).
-4. **`Runner.run(agent, message)`** runs the chosen entry agent (`sales_manager` or `careful`).
-5. The **Sales Manager** model executes a **tool loop**: it may call `sales_agent1`, `sales_agent2`, `sales_agent3` (each runs a full sub-agent run and returns text), then chooses a winner and calls `review_draft_email` (the analyser returns structured JSON via `DraftReview`).
-6. When satisfied, the model performs a **handoff** to **Email Manager** (SDK `handoffs=[emailer]`).
-7. **Email Manager** calls **`subject_writer`**, **`html_converter`**, then **`send_html_email`** with the final subject and HTML body.
-8. **`run_sdr_pipeline`** returns `{"final_output": ..., "last_agent": "..."}` after serialization via `_out()`.
+1. **`run.py`** calls `run_sdr_pipeline(USER_MESSAGE)` with natural language (contains recipient + instructions).
+2. **`_input_parser_agent()`** + **`Runner.run`** produce **`ParsedInput`**; invalid/missing email short-circuits with error **steps** / Telegram line.
+3. **`build_agents(recipient_email=...)`** validates `OPENAI_API_KEY` and `DEEPSEEK_API_KEY`, constructs DeepSeek client + `OpenAIChatCompletionsModel` for the three drafters, wires `gpt-4o-mini` agents for orchestration, review, subject, HTML, and the Email Manager.
+4. **`trace(WORKFLOW_TRACE_NAME or "Automated SDR")`** wraps the run for observability (see [Tracing](#tracing)).
+5. **`Runner.run(agent, brief, hooks=DemoRunHooks)`** runs the chosen entry agent; hooks drive **`log_step`** / Telegram live lines.
+6. The **Sales Manager** model executes a **tool loop**: it may call `sales_agent1`, `sales_agent2`, `sales_agent3` (each runs a full sub-agent run and returns text), then chooses a winner and calls `review_draft_email` (structured **`DraftReview`**).
+7. When satisfied, the model performs a **handoff** to **Email Manager** (SDK `handoffs=[emailer]`).
+8. **Email Manager** calls **`subject_writer`**, **`html_converter`**, then **`send_html_email`** with the final subject and HTML body to the **parsed** recipient (or env fallback).
+9. **`run_sdr_pipeline`** returns **`recipient_email`**, **`steps`**, **`final_output`** (via `_out()`), **`last_agent`**.
 
 ---
 
@@ -163,7 +171,7 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    A["User message"] --> B["Name check agent<br/>is_name_in_message?"]
+    A["User message"] --> B["Sender identity check<br/>is_name_in_message?"]
     B -->|true| C["tripwire_triggered<br/>guardrail blocks / fails path"]
     B -->|false| D["Proceed to Sales Manager tools + handoff"]
 ```
@@ -174,42 +182,10 @@ flowchart TD
 
 | Component | Model / backend | Notes |
 |-----------|-----------------|--------|
-| **Drafters** (`sales_agent1`–`3`) | `deepseek-chat` via `AsyncOpenAI(base_url=https://api.deepseek.com/v1)` and `OpenAIChatCompletionsModel` | Three **different instruction sets** (professional / witty / concise). Display names include “Gemini” / “Llama3.3” but **routing uses the same DeepSeek model** — only prompts differ. |
-| **Sales Manager**, **Email Manager**, **Email draft analyser**, **Name check**, **subject / html helpers** | `gpt-4o-mini` (OpenAI API, `OPENAI_API_KEY`) | Orchestration, structured `DraftReview`, guardrail check, subject, HTML. |
+| **Drafters** (`sales_agent1`–`3`) | `deepseek-chat` via `AsyncOpenAI(base_url=https://api.deepseek.com/v1)` and `OpenAIChatCompletionsModel` | Three **ComplAI drafter** roles: professional, engaging, and concise tone. **Same DeepSeek model**, different system instructions. |
+| **Sales Manager**, **Email Manager**, **Email draft reviewer**, **Sender identity check**, **Subject line writer**, **HTML body formatter**, **Input parser** | `gpt-4o-mini` (OpenAI API, `OPENAI_API_KEY`) | Orchestration, structured outputs, guardrail, subject, HTML. |
 | **Outbound mail** | SendGrid REST API | `send_html_email` builds `Mail` with HTML content. |
-
----
-
-## Environment variables
-
-Copy `.env.example` to `.env` and set:
-
-| Variable | Purpose |
-|----------|---------|
-| `OPENAI_API_KEY` | OpenAI API for `gpt-4o-mini` agents. |
-| `DEEPSEEK_API_KEY` | DeepSeek API for drafting agents. |
-| `SENDGRID_API_KEY` | Sending mail. |
-| `SENDGRID_FROM_EMAIL` | Verified sender. |
-| `SENDGRID_TO_EMAIL` | Recipient for this demo. |
-| `WORKFLOW_TRACE_NAME` | Optional; overrides default trace name `"Automated SDR"` in `run_sdr_pipeline`. |
-
----
-
-## How to run
-
-```bash
-cp .env.example .env
-# edit .env
-
-chmod +x setup_and_run.sh
-./setup_and_run.sh
-```
-
-Or manually: `python3 -m venv .venv` → `source .venv/bin/activate` → `pip install -r requirements.txt` → `python run.py`.
-
-**Ubuntu/Debian:** if `python3 -m venv` fails, install `python3-venv` / `python3.X-venv` (see previous README notes in this file’s history). Broken `.venv`: `rm -rf .venv` and rerun `./setup_and_run.sh`.
-
-To change the campaign brief, edit **`BRIEF`** in `run.py`.
+| **Telegram** (optional) | Bot HTTP API | `send_telegram_message` in `telegram_util.py`. |
 
 ---
 
@@ -219,7 +195,7 @@ To change the campaign brief, edit **`BRIEF`** in `run.py`.
 
 ```python
 with trace(name):  # name from WORKFLOW_TRACE_NAME or "Automated SDR"
-    result = await Runner.run(agent, message)
+    ...
 ```
 
 This aligns with the Agents SDK tracing helpers so you can correlate runs in supported tracing setups.
@@ -231,7 +207,7 @@ This aligns with the Agents SDK tracing helpers so you can correlate runs in sup
 Default **`run.py`** uses the Sales Manager **without** the name guardrail. To enable it:
 
 ```python
-result = await run_sdr_pipeline(BRIEF, use_name_guardrail=True)
+result = await run_sdr_pipeline(USER_MESSAGE, use_name_guardrail=True)
 ```
 
 When the guardrail trips, behavior follows the SDK’s guardrail semantics for blocked input (no normal completion through the Sales Manager).
@@ -240,5 +216,5 @@ When the guardrail trips, behavior follows the SDK’s guardrail semantics for b
 
 ## Summary
 
-- **Automation style:** one **orchestrator** agent with **sub-agents as tools**, a **structured reviewer tool**, **handoff** to a **sender** agent, optional **input guardrail**, and **tracing**.
-- **Deliverable:** a real email sent through **SendGrid** from a single natural-language brief — useful as a learning/demo baseline; production use would add approvers, suppression lists, rate limits, and clearer naming/model parity.
+- **Automation style:** one **orchestrator** agent with **sub-agents as tools**, a **structured reviewer tool**, **handoff** to a **sender** agent, optional **input guardrail**, **tracing**, and optional **Telegram** step streaming via **`log_step`**.
+- **Deliverable:** a real email sent through **SendGrid** from a single natural-language request — useful as a learning/demo baseline; production use would add approvers, suppression lists, rate limits, and stronger deliverability/compliance controls.

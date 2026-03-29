@@ -1,0 +1,41 @@
+"""Telegram notifications and per-run step logging (console + list + Telegram)."""
+
+from __future__ import annotations
+
+import contextvars
+import os
+import requests
+
+_steps_cv: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar("sdr_steps", default=None)
+
+
+def bind_steps_list(steps: list[str]) -> contextvars.Token[list[str] | None]:
+    """Call at pipeline start; reset with ``steps_reset`` in ``finally``."""
+    return _steps_cv.set(steps)
+
+
+def steps_reset(token: contextvars.Token[list[str] | None]) -> None:
+    _steps_cv.reset(token)
+
+
+def send_telegram_message(text: str) -> None:
+    try:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+        if not token or not chat_id or not (text or "").strip():
+            return
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=15,
+        )
+    except Exception:
+        pass
+
+
+def log_step(step: str) -> None:
+    print(step, flush=True)
+    buf = _steps_cv.get()
+    if buf is not None:
+        buf.append(step)
+    send_telegram_message(step)
