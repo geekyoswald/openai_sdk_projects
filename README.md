@@ -49,7 +49,7 @@ Optional **before drafting**: with **`Sales Manager (input screened)`**, an **in
 | `run.py` | `load_dotenv`, sets `USER_MESSAGE` (natural language), calls `run_sdr_pipeline`, prints JSON. |
 | `SETUP_LOCAL.md` | **Local** setup, `.env`, scripts, optional Telegram dev server. |
 | `setup_and_run_local.sh` | Local / macOS: venv + deps + `run.py` (no `apt` / `sudo`). |
-| `setup_and_run_aws.sh` | Ubuntu / Debian / EC2: installs `python3-venv` via `apt` if needed, then same. |
+| `setup_and_run_aws.sh` | Ubuntu / EC2: `apt` venv if needed, then **`uvicorn`** (Telegram webhook). `./setup_and_run_aws.sh cli` runs **`run.py`**. |
 | `setup_and_run.sh` | Alias for **`setup_and_run_local.sh`** (backward compatible). |
 | `requirements.txt` | `openai`, `openai-agents`, `sendgrid`, `python-dotenv`, `pydantic`, `requests`, `fastapi`, `uvicorn`. |
 | `.env.example` | Template for API keys and SendGrid / Telegram variables. |

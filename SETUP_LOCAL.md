@@ -89,4 +89,8 @@ If Telegram env vars are missing or invalid, the pipeline still runs; only notif
 
 ## 6. EC2 / Ubuntu server
 
-For **`apt`**-based **`python3-venv`** install and the same `run.py` flow, use **`./setup_and_run_aws.sh`**. Full project documentation: **[README.md](README.md)**.
+**`./setup_and_run_aws.sh`** (default): creates/uses `.venv`, installs deps, then starts **`uvicorn webhook_app:app`** on **`0.0.0.0:8000`** (override with **`WEBHOOK_HOST`** / **`WEBHOOK_PORT`**). Put nginx/ALB HTTPS in front; **`setWebhook`** → `https://your-domain/telegram-webhook`.
+
+**One-shot CLI demo (no bot):** **`./setup_and_run_aws.sh cli`** → **`python run.py`**.
+
+Full project documentation: **[README.md](README.md)**.

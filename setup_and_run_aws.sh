@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Ubuntu / Debian / EC2: install python3-venv via apt if needed, then venv + pip + run.py.
+# Ubuntu / Debian / EC2: install python3-venv via apt if needed, venv + pip, then —
+#   Default: Telegram webhook server (uvicorn, bind 0.0.0.0 for nginx / ALB / Telegram).
+#   CLI one-shot: ./setup_and_run_aws.sh cli  →  python run.py
+# Optional env: WEBHOOK_HOST (default 0.0.0.0), WEBHOOK_PORT (default 8000).
 # chmod +x setup_and_run_aws.sh && ./setup_and_run_aws.sh
 set -euo pipefail
 
@@ -49,4 +52,12 @@ fi
 source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-python run.py
+
+if [[ "${1:-}" == "cli" ]]; then
+  exec python run.py
+fi
+
+WH="${WEBHOOK_HOST:-0.0.0.0}"
+WP="${WEBHOOK_PORT:-8000}"
+echo "Starting Telegram webhook: http://${WH}:${WP}/telegram-webhook (setWebhook must use your public HTTPS URL → this path)" >&2
+exec python -m uvicorn webhook_app:app --host "$WH" --port "$WP"
