@@ -13,6 +13,9 @@ USER_MESSAGE = (
 
 
 async def main():
+    from telegram_util import configure_complai_logging
+
+    configure_complai_logging()
     from pipeline import run_sdr_pipeline
 
     result = await run_sdr_pipeline(USER_MESSAGE)

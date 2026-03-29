@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 from typing import Any
@@ -28,6 +29,8 @@ from agents.run_context import RunContextWrapper
 from agents.tool import Tool
 
 from telegram_util import bind_steps_list, log_step, steps_reset
+
+log = logging.getLogger("complai_sdr.pipeline")
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 
@@ -208,9 +211,11 @@ async def _review_tool_output_async(output: RunResult) -> str:
 
 
 def build_agents(recipient_email: str | None = None) -> tuple[Agent, Agent]:
-    if not os.environ.get("OPENAI_API_KEY"):
+    if not (os.environ.get("OPENAI_API_KEY") or "").strip():
+        log.error("build_agents aborted: OPENAI_API_KEY is missing or blank")
         raise RuntimeError("OPENAI_API_KEY is required")
-    if not os.environ.get("DEEPSEEK_API_KEY"):
+    if not (os.environ.get("DEEPSEEK_API_KEY") or "").strip():
+        log.error("build_agents aborted: DEEPSEEK_API_KEY is missing or blank")
         raise RuntimeError("DEEPSEEK_API_KEY is required")
 
     deepseek_client = AsyncOpenAI(
@@ -408,6 +413,7 @@ async def run_sdr_pipeline(message: str, *, use_name_guardrail: bool = False) ->
             raw_parsed = parse_result.final_output
 
             if raw_parsed is None:
+                log.warning("parse failed: Input parser returned no structured output")
                 await _log("❌ Could not find a valid email in your message")
                 return {
                     "recipient_email": "",
@@ -419,6 +425,11 @@ async def run_sdr_pipeline(message: str, *, use_name_guardrail: bool = False) ->
             p = raw_parsed if isinstance(raw_parsed, ParsedInput) else ParsedInput.model_validate(raw_parsed)
 
             if not _is_valid_email(p.recipient_email):
+                bad = (p.recipient_email or "").strip()
+                log.warning(
+                    "parse rejected recipient: not a valid email (got %r)",
+                    bad[:120] if bad else "(empty)",
+                )
                 await _log("❌ Could not find a valid email in your message")
                 return {
                     "recipient_email": (p.recipient_email or "").strip(),
@@ -439,6 +450,11 @@ async def run_sdr_pipeline(message: str, *, use_name_guardrail: bool = False) ->
             try:
                 result = await Runner.run(agent, brief, hooks=hooks, max_turns=max_turns)
             except MaxTurnsExceeded:
+                log.error(
+                    "Sales Manager hit MaxTurnsExceeded (max_turns=%s env SDR_MAX_TURNS=%r)",
+                    max_turns,
+                    os.environ.get("SDR_MAX_TURNS"),
+                )
                 await _log(
                     "⚠️ Step limit reached (review loops + send used all allowed turns). "
                     "Raising SDR_MAX_TURNS or trying a shorter brief may help."
