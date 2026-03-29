@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import os
+import re
 import requests
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -57,6 +58,37 @@ def _parse_telegram_chat_id(chat_raw: str) -> int | str:
     return chat_raw
 
 
+def redact_telegram_url_for_log(url: str) -> str:
+    """Mask bot token in paths like ``/bot123:AA…`` so logs are safe to share."""
+    if not url:
+        return url
+    return re.sub(r"(/bot)(\d+):[^/?#&\s]+", r"\1\2:***", str(url))
+
+
+def _extract_public_url_from_setwebhook_paste(s: str) -> str | None:
+    """
+    Parse ``url=`` out of a pasted browser/curl line like
+    ``https://api.telegram.org/bot…/setWebhook?url=https%3A%2F%2Fhost%2Fpath``.
+    Uses ``parse_qs`` first, then a regex fallback (some .env line wraps break urlparse).
+    """
+    low = s.lower()
+    if "api.telegram.org" not in s or "setwebhook" not in low:
+        return None
+    parsed = urlparse(s)
+    qd = parse_qs(parsed.query)
+    inner: str | None = None
+    for key, vals in qd.items():
+        if key.lower() == "url" and vals:
+            inner = vals[0]
+            break
+    if inner:
+        return unquote(inner).strip()
+    m = re.search(r"(?i)[?&]url=([^&]+)", s)
+    if m:
+        return unquote(m.group(1).strip()).strip()
+    return None
+
+
 def normalize_telegram_webhook_url(raw: str) -> tuple[str | None, str | None]:
     """
     Return ``(url_for_setWebhook, remediation_note)``.
@@ -68,21 +100,20 @@ def normalize_telegram_webhook_url(raw: str) -> tuple[str | None, str | None]:
     if not s:
         return None, "TELEGRAM_WEBHOOK_URL is empty; webhook will not be registered on startup."
 
-    if "api.telegram.org" in s and "setWebhook" in s.lower():
-        parsed = urlparse(s)
-        qs = parse_qs(parsed.query)
-        inner = (qs.get("url") or [None])[0]
-        if inner:
-            decoded = unquote(inner)
-            note = (
-                "TELEGRAM_WEBHOOK_URL was a full setWebhook API URL; using the embedded url= value. "
-                "Prefer setting TELEGRAM_WEBHOOK_URL to only your public endpoint "
-                "(e.g. https://your.domain/telegramwebhook)."
-            )
-            return decoded, note
+    note: str | None = None
+    extracted = _extract_public_url_from_setwebhook_paste(s)
+    if extracted:
+        s = extracted
+        note = (
+            "TELEGRAM_WEBHOOK_URL was a full setWebhook API URL; using the embedded url= value. "
+            "Prefer setting TELEGRAM_WEBHOOK_URL to only your public endpoint "
+            "(e.g. https://your.domain/telegramwebhook)."
+        )
+
+    if "api.telegram.org" in s:
         return None, (
-            "TELEGRAM_WEBHOOK_URL looks like a Telegram API setWebhook link but has no url= query parameter. "
-            "Set it to your HTTPS origin only, e.g. https://your.domain/telegramwebhook."
+            "TELEGRAM_WEBHOOK_URL still points at api.telegram.org after normalization; "
+            "set it to only your HTTPS public URL, e.g. https://your.domain/telegramwebhook"
         )
 
     if not s.startswith(("https://", "http://")):
@@ -97,7 +128,7 @@ def normalize_telegram_webhook_url(raw: str) -> tuple[str | None, str | None]:
             "(unless using a local tunnel)."
         )
 
-    return s, None
+    return s, note
 
 
 def send_telegram_message(text: str) -> None:
@@ -150,6 +181,13 @@ def send_telegram_message(text: str) -> None:
                 "TELEGRAM_CHAT_ID must be the chat where this bot can write: same bot token, user sent /start, "
                 "id is message.chat.id (private: often 10 digits). Typos (e.g. missing digit) cause this error."
             )
+            if isinstance(chat_id, int) and chat_id > 0:
+                sd = str(chat_id)
+                if len(sd) < 10:
+                    hints.append(
+                        f"This chat_id has {len(sd)} digits; many Telegram user ids are 10 digits—compare with "
+                        "message.chat.id from an update to this bot."
+                    )
         if "unauthorized" in low or err_code == 401:
             hints.append("TELEGRAM_BOT_TOKEN is invalid or revoked; get a new token from @BotFather.")
         if "bot was blocked" in low:

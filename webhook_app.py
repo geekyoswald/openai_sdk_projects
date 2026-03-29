@@ -25,7 +25,11 @@ def _drop_pending_telegram_updates() -> None:
     """Tell Telegram to clear pending updates (requires public webhook URL in env)."""
     import requests
 
-    from telegram_util import normalize_env_value, normalize_telegram_webhook_url
+    from telegram_util import (
+        normalize_env_value,
+        normalize_telegram_webhook_url,
+        redact_telegram_url_for_log,
+    )
 
     raw_url = os.environ.get("TELEGRAM_WEBHOOK_URL") or ""
     hook_url, url_note = normalize_telegram_webhook_url(raw_url)
@@ -53,7 +57,11 @@ def _drop_pending_telegram_updates() -> None:
             timeout=20,
         )
     except requests.RequestException as ex:
-        log.error("setWebhook request failed: %s (target_url=%s)", ex, hook_url)
+        log.error(
+            "setWebhook request failed: %s (target_url=%s)",
+            ex,
+            redact_telegram_url_for_log(hook_url),
+        )
         return
 
     try:
@@ -70,7 +78,7 @@ def _drop_pending_telegram_updates() -> None:
     if data.get("ok"):
         log.info(
             "setWebhook ok url=%s drop_pending_updates=true (HTTP %s)",
-            hook_url,
+            redact_telegram_url_for_log(hook_url),
             r.status_code,
         )
         return
@@ -81,7 +89,7 @@ def _drop_pending_telegram_updates() -> None:
         data.get("error_code"),
         (data.get("description") or r.text or "")[:500],
         r.status_code,
-        hook_url,
+        redact_telegram_url_for_log(hook_url),
     )
 
 
