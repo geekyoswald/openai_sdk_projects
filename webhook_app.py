@@ -10,7 +10,7 @@ load_dotenv(override=True)
 app = FastAPI(title="ComplAI SDR Telegram demo")
 
 
-@app.post("/telegram-webhook")
+@app.post("/telegramwebhook")
 async def telegram_webhook(req: Request) -> dict[str, bool]:
     try:
         body: dict = await req.json()
