@@ -1,4 +1,6 @@
 .env
+.webhook.pid
+logs/
 .venv/
 venv/
 __pycache__/
