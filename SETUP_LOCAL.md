@@ -81,7 +81,7 @@ uvicorn webhook_app:app --host 127.0.0.1 --port 8000
 ```
 
 Point your bot’s webhook at your public URL (e.g. via **ngrok**):  
-`https://<host>/telegram-webhook`
+`https://<host>/telegramwebhook`
 
 If Telegram env vars are missing or invalid, the pipeline still runs; only notifications are skipped.
 
@@ -89,7 +89,7 @@ If Telegram env vars are missing or invalid, the pipeline still runs; only notif
 
 ## 6. EC2 / Ubuntu server
 
-**`./setup_and_run_aws.sh`** (default): creates/uses `.venv`, installs deps, then starts **`uvicorn webhook_app:app`** on **`0.0.0.0:8000`** (override with **`WEBHOOK_HOST`** / **`WEBHOOK_PORT`**). Put nginx/ALB HTTPS in front; **`setWebhook`** → `https://your-domain/telegram-webhook`.
+**`./setup_and_run_aws.sh`** (default): creates/uses `.venv`, installs deps, then starts **`uvicorn webhook_app:app`** on **`0.0.0.0:8000`** (override with **`WEBHOOK_HOST`** / **`WEBHOOK_PORT`**). Put nginx/ALB HTTPS in front; **`setWebhook`** → `https://your-domain/telegramwebhook`.
 
 **One-shot CLI demo (no bot):** **`./setup_and_run_aws.sh cli`** → **`python run.py`**.
 

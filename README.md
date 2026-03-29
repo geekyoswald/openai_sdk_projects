@@ -45,7 +45,7 @@ Optional **before drafting**: with **`Sales Manager (input screened)`**, an **in
 |------|------|
 | `pipeline.py` | Builds all agents, tools, handoffs, guardrail; exports `run_sdr_pipeline`. |
 | `telegram_util.py` | `send_telegram_message`, `log_step`, per-run `steps` context (`bind_steps_list` / `steps_reset`). |
-| `webhook_app.py` | FastAPI `POST /telegram-webhook` → `run_sdr_pipeline`. |
+| `webhook_app.py` | FastAPI `POST /telegramwebhook` → `run_sdr_pipeline`. |
 | `run.py` | `load_dotenv`, sets `USER_MESSAGE` (natural language), calls `run_sdr_pipeline`, prints JSON. |
 | `SETUP_LOCAL.md` | **Local** setup, `.env`, scripts, optional Telegram dev server. |
 | `setup_and_run_local.sh` | Local / macOS: venv + deps + `run.py` (no `apt` / `sudo`). |
