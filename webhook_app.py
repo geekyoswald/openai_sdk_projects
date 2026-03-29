@@ -6,10 +6,13 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 
+from pathlib import Path
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 
-load_dotenv(override=True)
+# Always load .env next to this file (uvicorn cwd is often not the project dir).
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 # Drop backlog so restarts don't replay every queued Telegram update at once.
 _MAX_SEEN_UPDATE_IDS = 8192
@@ -65,14 +68,20 @@ async def telegram_webhook(req: Request) -> dict[str, bool]:
 
     if text:
         from pipeline import run_sdr_pipeline
+        from telegram_util import send_telegram_message
 
         async with _pipeline_lock:
             if uid is not None and uid in _processed_update_ids:
                 return {"ok": True}
+            try:
+                await run_sdr_pipeline(text)
+            except Exception as ex:
+                # Return 200 + mark update so Telegram does not retry forever (e.g. after HTTP 500).
+                print(f"[webhook] pipeline error: {ex}", flush=True)
+                send_telegram_message(f"❌ Pipeline error: {ex!s}"[:3800])
             if uid is not None:
                 _processed_update_ids.add(uid)
                 if len(_processed_update_ids) > _MAX_SEEN_UPDATE_IDS:
                     _processed_update_ids.clear()
-            await run_sdr_pipeline(text)
 
     return {"ok": True}

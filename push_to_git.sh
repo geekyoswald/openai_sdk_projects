@@ -31,6 +31,6 @@ fi
 
 MSG="${1:-Update}"
 git commit -m "$MSG"
-git push
+git push -u origin master
 
 echo "Pushed ($LABEL): $MSG"

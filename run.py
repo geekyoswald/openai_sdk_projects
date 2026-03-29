@@ -1,9 +1,10 @@
 import asyncio
 import json
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 # Natural-language request: parser extracts recipient_email + brief for the SDR chain.
 USER_MESSAGE = (

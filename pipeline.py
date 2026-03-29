@@ -22,6 +22,7 @@ from agents import (
     input_guardrail,
     trace,
 )
+from agents.exceptions import MaxTurnsExceeded
 from agents.lifecycle import RunHooks
 from agents.run_context import RunContextWrapper
 from agents.tool import Tool
@@ -100,7 +101,8 @@ Reject (accept: false) if the draft is off-brief, misleading, or unfair to the r
 SALES_MANAGER_INSTRUCTIONS = """
 You are a Sales Manager at ComplAI. Use sales_agent1, sales_agent2, sales_agent3 to get three drafts (body only, no subject).
 Pick the best option for the user's stated goal and audience—not a default preference for one tone. Call review_draft_email with the user's request, all three drafts, chosen number (1–3), winning body, and rationale.
-If accept is true, hand off the winning body to Email Manager via transfer_to_email_manager. If accept is false, revise and review again (at most two rounds), then hand off if needed per your judgment.
+If accept is true, hand off the winning body to Email Manager via transfer_to_email_manager.
+If accept is false, revise once (regenerate drafts as needed), call review_draft_email exactly one more time, then hand off to Email Manager—never a third review round.
 """
 
 INPUT_PARSER_INSTRUCTIONS = """You parse the user's message into two fields only (structured output, no extra text).
@@ -121,6 +123,16 @@ async def _delay_if_configured() -> None:
 async def _log(step: str) -> None:
     log_step(step)
     await _delay_if_configured()
+
+
+def _sales_manager_max_turns() -> int:
+    """Default agent run is 10; draft + at most one review loop + Email Manager need headroom."""
+    raw = os.environ.get("SDR_MAX_TURNS", "28")
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 28
+    return max(15, min(n, 80))
 
 
 class DemoRunHooks(RunHooks):
@@ -242,11 +254,41 @@ def build_agents(recipient_email: str | None = None) -> tuple[Agent, Agent]:
         model="gpt-4o-mini",
         output_type=DraftReview,
     )
-    review_tool = draft_reviewer.as_tool(
-        tool_name="review_draft_email",
-        tool_description="Review draft choice; returns JSON with accept and feedback.",
-        custom_output_extractor=_review_tool_output_async,
+    # Enforce at most one rejection per run; second reject is coerced to accept in the wrapper.
+    _review_once_state: dict[str, bool] = {"saw_reject": False}
+
+    @function_tool(
+        name_override="review_draft_email",
+        description_override=(
+            "Review draft choice; returns JSON with accept and feedback. "
+            "Only one rejection per email run is allowed; after one revision the next result accepts."
+        ),
     )
+    async def review_draft_email(ctx: RunContextWrapper[Any], input: str) -> str:
+        output = await Runner.run(
+            draft_reviewer,
+            input,
+            context=ctx.context,
+            max_turns=10,
+        )
+        raw = await _review_tool_output_async(output)
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return raw
+        if data.get("accept") is False:
+            if _review_once_state["saw_reject"]:
+                fb = (data.get("feedback") or "").strip()
+                data["accept"] = True
+                data["feedback"] = (
+                    "Accepted after one revision (max one rejection per run). Notes: "
+                    + (fb or "(none)")
+                )
+            else:
+                _review_once_state["saw_reject"] = True
+        return json.dumps(data)
+
+    review_tool = review_draft_email
 
     to_override = (recipient_email or "").strip()
 
@@ -393,7 +435,21 @@ async def run_sdr_pipeline(message: str, *, use_name_guardrail: bool = False) ->
             sm, careful = build_agents(recipient_email=recipient)
             agent = careful if use_name_guardrail else sm
             hooks = DemoRunHooks()
-            result = await Runner.run(agent, brief, hooks=hooks)
+            max_turns = _sales_manager_max_turns()
+            try:
+                result = await Runner.run(agent, brief, hooks=hooks, max_turns=max_turns)
+            except MaxTurnsExceeded:
+                await _log(
+                    "⚠️ Step limit reached (review loops + send used all allowed turns). "
+                    "Raising SDR_MAX_TURNS or trying a shorter brief may help."
+                )
+                return {
+                    "recipient_email": recipient,
+                    "steps": steps,
+                    "final_output": None,
+                    "last_agent": getattr(agent, "name", "Sales Manager"),
+                    "error": "max_turns_exceeded",
+                }
 
         await _log("🎉 Workflow completed successfully!")
 

@@ -20,17 +20,33 @@ def steps_reset(token: contextvars.Token[list[str] | None]) -> None:
 
 def send_telegram_message(text: str) -> None:
     try:
-        token = os.environ.get("TELEGRAM_BOT_TOKEN")
-        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-        if not token or not chat_id or not (text or "").strip():
+        token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+        chat_raw = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+        if not token or not chat_raw or not (text or "").strip():
             return
-        requests.post(
+        # Telegram accepts int or string chat_id; normalize numeric strings.
+        chat_id: int | str
+        if chat_raw.lstrip("-").isdigit():
+            chat_id = int(chat_raw)
+        else:
+            chat_id = chat_raw
+        r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": text},
             timeout=15,
         )
-    except Exception:
-        pass
+        try:
+            data = r.json()
+            if not data.get("ok"):
+                print(
+                    f"[telegram] sendMessage failed: {data.get('description', r.text)[:500]}",
+                    flush=True,
+                )
+        except Exception:
+            if r.status_code != 200:
+                print(f"[telegram] HTTP {r.status_code}: {r.text[:500]}", flush=True)
+    except Exception as ex:
+        print(f"[telegram] sendMessage error: {ex}", flush=True)
 
 
 def log_step(step: str) -> None:
