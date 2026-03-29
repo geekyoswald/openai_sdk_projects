@@ -31,6 +31,7 @@ Edit **`.env`** and set at least:
 | `WORKFLOW_TRACE_NAME` | No | Custom trace label (default `Automated SDR`). |
 | `TELEGRAM_BOT_TOKEN` | No | Live step updates to Telegram. |
 | `TELEGRAM_CHAT_ID` | No | Target chat for bot messages. |
+| `TELEGRAM_WEBHOOK_URL` | **Yes for webhook server** | Full HTTPS URL, e.g. `https://your-domain.com/telegramwebhook` (same as **`setWebhook`**). On startup the app re-registers with **`drop_pending_updates`** so Telegram doesn’t replay a backlog when the server restarts. |
 | `TELEGRAM_STEP_DELAY_SEC` | No | Delay between steps (e.g. `0.5` for demos). Default `0`. |
 
 ---
@@ -77,8 +78,10 @@ Edit **`USER_MESSAGE`** in **`run.py`**. Include a valid **`someone@domain`** ad
 After `pip install -r requirements.txt`, from **`complai_sdr_email/`**:
 
 ```bash
-uvicorn webhook_app:app --host 127.0.0.1 --port 8000
+uvicorn webhook_app:app --host 127.0.0.1 --port 8000 --timeout-graceful-shutdown 5
 ```
+
+If **Ctrl+C** seems stuck, uvicorn may be waiting on a long request; press **Ctrl+C again** to force quit, or run **`pkill -f "uvicorn webhook_app"`** from another shell. The webhook runs **one** pipeline at a time (`asyncio.Lock`) so queued Telegram updates don’t overlap.
 
 Point your bot’s webhook at your public URL (e.g. via **ngrok**):  
 `https://<host>/telegramwebhook`

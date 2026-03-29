@@ -60,4 +60,5 @@ fi
 WH="${WEBHOOK_HOST:-0.0.0.0}"
 WP="${WEBHOOK_PORT:-8000}"
 echo "Starting Telegram webhook: http://${WH}:${WP}/telegramwebhook (setWebhook must use your public HTTPS URL → this path)" >&2
-exec python -m uvicorn webhook_app:app --host "$WH" --port "$WP"
+# --timeout-graceful-shutdown: don't hang on Ctrl+C while a long run_sdr_pipeline is in flight
+exec python -m uvicorn webhook_app:app --host "$WH" --port "$WP" --timeout-graceful-shutdown 5

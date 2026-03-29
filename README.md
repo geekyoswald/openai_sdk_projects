@@ -185,7 +185,7 @@ flowchart TD
 | **Drafters** (`sales_agent1`–`3`) | `deepseek-chat` via `AsyncOpenAI(base_url=https://api.deepseek.com/v1)` and `OpenAIChatCompletionsModel` | Three **ComplAI drafter** roles: professional, engaging, and concise tone. **Same DeepSeek model**, different system instructions. |
 | **Sales Manager**, **Email Manager**, **Email draft reviewer**, **Sender identity check**, **Subject line writer**, **HTML body formatter**, **Input parser** | `gpt-4o-mini` (OpenAI API, `OPENAI_API_KEY`) | Orchestration, structured outputs, guardrail, subject, HTML. |
 | **Outbound mail** | SendGrid REST API | `send_html_email` builds `Mail` with HTML content. |
-| **Telegram** (optional) | Bot HTTP API | `send_telegram_message` in `telegram_util.py`. |
+| **Telegram** (optional) | Bot HTTP API | `send_telegram_message` in `telegram_util.py`. On **`webhook_app`** startup, **`TELEGRAM_WEBHOOK_URL`** + token trigger **`setWebhook`** with **`drop_pending_updates`** so restarts don’t process a queued flood. **`update_id`** dedup skips retry duplicates. |
 
 ---
 
