@@ -10,6 +10,11 @@ import requests
 from urllib.parse import parse_qs, unquote, urlparse
 
 _steps_cv: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar("sdr_steps", default=None)
+# When set (e.g. Telegram webhook), step notifications go here instead of TELEGRAM_CHAT_ID.
+_reply_chat_cv: contextvars.ContextVar[int | str | None] = contextvars.ContextVar(
+    "sdr_reply_chat",
+    default=None,
+)
 
 log = logging.getLogger("complai_sdr.telegram")
 
@@ -43,6 +48,15 @@ def steps_reset(token: contextvars.Token[list[str] | None]) -> None:
     _steps_cv.reset(token)
 
 
+def bind_reply_chat(chat_id: int | str) -> contextvars.Token[int | str | None]:
+    """Route ``log_step`` / ``send_telegram_message`` to this chat for the current async task."""
+    return _reply_chat_cv.set(chat_id)
+
+
+def reply_chat_reset(token: contextvars.Token[int | str | None]) -> None:
+    _reply_chat_cv.reset(token)
+
+
 def normalize_env_value(value: str | None) -> str:
     """Strip whitespace and outer quotes (common mistake in ``.env``)."""
     s = (value or "").strip()
@@ -56,6 +70,12 @@ def _parse_telegram_chat_id(chat_raw: str) -> int | str:
     if chat_raw.lstrip("-").isdigit():
         return int(chat_raw)
     return chat_raw
+
+
+def _chat_id_for_api(chat: int | str) -> int | str:
+    if isinstance(chat, int):
+        return chat
+    return _parse_telegram_chat_id(str(chat).strip())
 
 
 def redact_telegram_url_for_log(url: str) -> str:
@@ -131,11 +151,13 @@ def normalize_telegram_webhook_url(raw: str) -> tuple[str | None, str | None]:
     return s, note
 
 
-def send_telegram_message(text: str) -> None:
-    """Post a message to TELEGRAM_CHAT_ID; logs precise skip/failure reasons."""
+def send_telegram_message(text: str, *, chat_id: int | str | None = None) -> None:
+    """
+    Post to Telegram. Target chat: ``chat_id`` argument (one-shot), else per-run
+    :func:`bind_reply_chat` (webhook sender), else ``TELEGRAM_CHAT_ID`` (CLI / fallback).
+    """
     try:
         token = normalize_env_value(os.environ.get("TELEGRAM_BOT_TOKEN"))
-        chat_raw = normalize_env_value(os.environ.get("TELEGRAM_CHAT_ID"))
         if not (text or "").strip():
             log.debug("send_telegram_message skipped: empty text")
             return
@@ -145,16 +167,24 @@ def send_telegram_message(text: str) -> None:
                 "(check .env next to webhook_app.py and restart)."
             )
             return
-        if not chat_raw:
-            log.warning(
-                "sendMessage skipped: TELEGRAM_CHAT_ID is missing or empty "
-                "(use numeric message.chat.id from an update to this bot)."
-            )
-            return
-        chat_id = _parse_telegram_chat_id(chat_raw)
+
+        target: int | str | None = chat_id
+        if target is None:
+            target = _reply_chat_cv.get()
+        if target is None:
+            chat_raw = normalize_env_value(os.environ.get("TELEGRAM_CHAT_ID"))
+            if not chat_raw:
+                log.warning(
+                    "sendMessage skipped: no target chat (webhook should send message.chat.id; "
+                    "for CLI set TELEGRAM_CHAT_ID)."
+                )
+                return
+            chat_id_api = _parse_telegram_chat_id(chat_raw)
+        else:
+            chat_id_api = _chat_id_for_api(target)
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
+            json={"chat_id": chat_id_api, "text": text},
             timeout=15,
         )
         try:
@@ -169,7 +199,7 @@ def send_telegram_message(text: str) -> None:
             return
 
         if data.get("ok"):
-            log.debug("sendMessage ok chat_id=%s", chat_id)
+            log.debug("sendMessage ok chat_id=%s", chat_id_api)
             return
 
         desc = (data.get("description") or r.text or "")[:500]
@@ -181,8 +211,8 @@ def send_telegram_message(text: str) -> None:
                 "TELEGRAM_CHAT_ID must be the chat where this bot can write: same bot token, user sent /start, "
                 "id is message.chat.id (private: often 10 digits). Typos (e.g. missing digit) cause this error."
             )
-            if isinstance(chat_id, int) and chat_id > 0:
-                sd = str(chat_id)
+            if isinstance(chat_id_api, int) and chat_id_api > 0:
+                sd = str(chat_id_api)
                 if len(sd) < 10:
                     hints.append(
                         f"This chat_id has {len(sd)} digits; many Telegram user ids are 10 digits—compare with "
@@ -199,7 +229,7 @@ def send_telegram_message(text: str) -> None:
             "sendMessage failed error_code=%s description=%s chat_id=%s%s",
             err_code,
             desc,
-            chat_id,
+            chat_id_api,
             hint_txt,
         )
     except requests.RequestException as ex:

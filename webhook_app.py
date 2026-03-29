@@ -109,6 +109,20 @@ app = FastAPI(title="ComplAI SDR Telegram demo", lifespan=lifespan)
 _pipeline_lock = asyncio.Lock()
 
 
+def _telegram_sender_chat_id(msg: object) -> int | None:
+    if not isinstance(msg, dict):
+        return None
+    ch = msg.get("chat")
+    if not isinstance(ch, dict):
+        return None
+    cid = ch.get("id")
+    if isinstance(cid, int):
+        return cid
+    if isinstance(cid, str) and cid.strip().lstrip("-").isdigit():
+        return int(cid.strip())
+    return None
+
+
 @app.post("/telegramwebhook")
 async def telegram_webhook(req: Request) -> dict[str, bool]:
     try:
@@ -125,8 +139,10 @@ async def telegram_webhook(req: Request) -> dict[str, bool]:
 
     msg = body.get("message") or body.get("edited_message") or {}
     text = ""
+    sender_chat_id: int | None = None
     if isinstance(msg, dict):
         text = (msg.get("text") or "").strip()
+        sender_chat_id = _telegram_sender_chat_id(msg)
 
     if not text:
         keys = [k for k in ("message", "edited_message", "callback_query") if body.get(k)]
@@ -149,10 +165,13 @@ async def telegram_webhook(req: Request) -> dict[str, bool]:
             log.debug("webhook: duplicate update_id=%s inside lock", uid)
             return {"ok": True}
         try:
-            await run_sdr_pipeline(text)
+            await run_sdr_pipeline(text, telegram_chat_id=sender_chat_id)
         except Exception as ex:
             log.exception("webhook update_id=%s: pipeline failed", uid)
-            send_telegram_message(f"❌ Pipeline error: {ex!s}"[:3800])
+            send_telegram_message(
+                f"❌ Pipeline error: {ex!s}"[:3800],
+                chat_id=sender_chat_id,
+            )
         if uid is not None:
             _processed_update_ids.add(uid)
             if len(_processed_update_ids) > _MAX_SEEN_UPDATE_IDS:

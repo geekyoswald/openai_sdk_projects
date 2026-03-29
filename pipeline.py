@@ -28,7 +28,7 @@ from agents.lifecycle import RunHooks
 from agents.run_context import RunContextWrapper
 from agents.tool import Tool
 
-from telegram_util import bind_steps_list, log_step, steps_reset
+from telegram_util import bind_reply_chat, bind_steps_list, log_step, reply_chat_reset, steps_reset
 
 log = logging.getLogger("complai_sdr.pipeline")
 
@@ -400,9 +400,15 @@ def _out(obj: Any) -> Any:
     return str(obj)
 
 
-async def run_sdr_pipeline(message: str, *, use_name_guardrail: bool = False) -> dict[str, Any]:
+async def run_sdr_pipeline(
+    message: str,
+    *,
+    use_name_guardrail: bool = False,
+    telegram_chat_id: int | str | None = None,
+) -> dict[str, Any]:
     steps: list[str] = []
     ctx_tok = bind_steps_list(steps)
+    reply_tok = bind_reply_chat(telegram_chat_id) if telegram_chat_id is not None else None
     trace_name = os.environ.get("WORKFLOW_TRACE_NAME", "Automated SDR")
     try:
         with trace(trace_name):
@@ -476,5 +482,7 @@ async def run_sdr_pipeline(message: str, *, use_name_guardrail: bool = False) ->
             "last_agent": result.last_agent.name,
         }
     finally:
+        if reply_tok is not None:
+            reply_chat_reset(reply_tok)
         steps_reset(ctx_tok)
 
